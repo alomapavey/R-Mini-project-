@@ -1,0 +1,180 @@
+library(shiny)
+library(DT)
+
+# ---------------------------------------------------------------
+# Seed data: a small nested structure simulating a records export.
+# In production this would be loaded from a secure database and
+# should never contain real patient identifiers in plain text.
+# ---------------------------------------------------------------
+make_seed_patients <- function() {
+  list(
+    "PT-1001" = list(
+      demographics = list(name = "Subject A", dob = "1985-03-11",
+                          arm = "Arm A - Standard Dose", status = "Active"),
+      logs = data.frame(
+        cycle   = 1:3,
+        date    = as.Date(c("2026-06-01", "2026-06-15", "2026-06-29")),
+        drug    = c("CompoundX", "CompoundX", "CompoundX"),
+        dose_mg = c(50, 50, 75),
+        notes   = c("Baseline tolerated well", "No adverse events", "Mild nausea reported"),
+        status  = c("Completed", "Completed", "Completed"),
+        stringsAsFactors = FALSE
+      )
+    ),
+    "PT-1002" = list(
+      demographics = list(name = "Subject B", dob = "1978-11-02",
+                          arm = "Arm B - High Dose", status = "Active"),
+      logs = data.frame(
+        cycle   = 1:2,
+        date    = as.Date(c("2026-05-20", "2026-06-03")),
+        drug    = c("CompoundX", "CompoundX"),
+        dose_mg = c(100, 100),
+        notes   = c("Enrolled", "Vitals stable"),
+        status  = c("Completed", "Completed"),
+        stringsAsFactors = FALSE
+      )
+    ),
+    "PT-1003" = list(
+      demographics = list(name = "Subject C", dob = "1990-07-23",
+                          arm = "Arm A - Standard Dose", status = "Withdrawn"),
+      logs = data.frame(
+        cycle   = 1,
+        date    = as.Date("2026-04-10"),
+        drug    = "CompoundX",
+        dose_mg = 50,
+        notes   = "Withdrew consent after Cycle 1",
+        status  = "Discontinued",
+        stringsAsFactors = FALSE
+      )
+    )
+  )
+}
+
+# ---------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------
+ui <- fluidPage(
+  titlePanel("Clinical Trial Record Auditor"),
+
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("patient_id", "Select Patient", choices = NULL),
+      hr(),
+      h4("Patient Summary"),
+      tableOutput("demo_table"),
+      hr(),
+
+      h4("Add Treatment Cycle"),
+      numericInput("new_dose", "Dose (mg)", value = 50, min = 0, step = 5),
+      textInput("new_drug", "Drug", value = "CompoundX"),
+      textAreaInput("new_notes", "Notes", value = "", rows = 3),
+      selectInput("new_status", "Status",
+                  choices = c("Scheduled", "Completed", "Adverse Event", "Discontinued")),
+      actionButton("add_row", "Add Cycle", class = "btn-primary", icon = icon("plus")),
+      hr(),
+
+      h4("Purge Records"),
+      helpText("Select one or more rows in the table, then purge them, ",
+               "or clear everything older than the cutoff date below."),
+      actionButton("purge_selected", "Purge Selected Rows", class = "btn-danger", icon = icon("trash")),
+      br(), br(),
+      dateInput("cutoff_date", "Purge entries older than:", value = Sys.Date() - 180),
+      actionButton("purge_old", "Purge Outdated Entries", class = "btn-warning", icon = icon("broom"))
+    ),
+
+    mainPanel(
+      h4("Treatment Log"),
+      DTOutput("log_table"),
+      br(),
+      verbatimTextOutput("action_log")
+    )
+  )
+)
+
+# ---------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------
+server <- function(input, output, session) {
+
+  # Nested store, kept in reactiveValues so edits are isolated per session
+  rv <- reactiveValues(patients = make_seed_patients(), messages = character(0))
+
+  observe({
+    updateSelectInput(session, "patient_id", choices = names(rv$patients))
+  })
+
+  current_patient <- reactive({
+    req(input$patient_id)
+    rv$patients[[input$patient_id]]
+  })
+
+  log_msg <- function(txt) {
+    rv$messages <- c(sprintf("[%s] %s", format(Sys.time(), "%H:%M:%S"), txt), rv$messages)
+  }
+
+  output$demo_table <- renderTable({
+    d <- current_patient()$demographics
+    data.frame(Field = c("Name", "DOB", "Arm", "Status"),
+               Value = c(d$name, d$dob, d$arm, d$status))
+  }, colnames = FALSE)
+
+  output$log_table <- renderDT({
+    datatable(
+      current_patient()$logs,
+      selection = "multiple",
+      rownames = FALSE,
+      options = list(pageLength = 8, order = list(list(0, "asc")))
+    )
+  })
+
+  # ---- Add a treatment cycle row -------------------------------
+  observeEvent(input$add_row, {
+    req(input$patient_id)
+    logs <- rv$patients[[input$patient_id]]$logs
+    next_cycle <- if (nrow(logs) == 0) 1 else max(logs$cycle) + 1
+
+    new_row <- data.frame(
+      cycle   = next_cycle,
+      date    = Sys.Date(),
+      drug    = input$new_drug,
+      dose_mg = input$new_dose,
+      notes   = input$new_notes,
+      status  = input$new_status,
+      stringsAsFactors = FALSE
+    )
+
+    rv$patients[[input$patient_id]]$logs <- rbind(logs, new_row)
+    log_msg(sprintf("Added Cycle %d for %s (%s).", next_cycle, input$patient_id, input$new_drug))
+  })
+
+  # ---- Purge selected rows --------------------------------------
+  observeEvent(input$purge_selected, {
+    req(input$patient_id)
+    sel <- input$log_table_rows_selected
+    if (length(sel) == 0) {
+      log_msg("Purge skipped: no rows were selected.")
+      return(invisible())
+    }
+    logs <- rv$patients[[input$patient_id]]$logs
+    rv$patients[[input$patient_id]]$logs <- logs[-sel, , drop = FALSE]
+    log_msg(sprintf("Purged %d selected row(s) for %s.", length(sel), input$patient_id))
+  })
+
+  # ---- Purge rows older than cutoff ------------------------------
+  observeEvent(input$purge_old, {
+    req(input$patient_id)
+    logs <- rv$patients[[input$patient_id]]$logs
+    keep <- logs$date >= input$cutoff_date
+    n_removed <- sum(!keep)
+    rv$patients[[input$patient_id]]$logs <- logs[keep, , drop = FALSE]
+    log_msg(sprintf("Purged %d outdated row(s) for %s (older than %s).",
+                     n_removed, input$patient_id, input$cutoff_date))
+  })
+
+  output$action_log <- renderText({
+    if (length(rv$messages) == 0) return("No actions yet.")
+    paste(rv$messages, collapse = "\n")
+  })
+}
+
+shinyApp(ui, server)
